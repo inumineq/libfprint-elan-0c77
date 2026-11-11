@@ -48,7 +48,7 @@ and neither does the older `elan` image driver.
 Build requirements: `base-devel`, `git`, `meson`, `glib2-devel`.
 
 ```sh
-git clone <this repository>
+git clone https://github.com/inumineq/libfprint-elan-0c77.git
 cd libfprint-elan-0c77
 makepkg -si
 sudo pacman -S --needed fprintd
