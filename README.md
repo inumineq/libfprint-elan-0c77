@@ -22,8 +22,9 @@ Working, with one known problem. Tested on a single machine.
 | Finger resting on the sensor while the device is opened | Fails in about 1 of 10 cases, see [Known problems](#known-problems) |
 | Omarchy's fingerprint setup (`omarchy-setup-security-fingerprint`) | Completed: enroll, verify and PAM configuration |
 | Lock screen | Unlocks with the fingerprint |
-| sudo, polkit | Configured by the setup; not exercised yet |
-| Suspend/resume | Not tested yet |
+| Suspend (s2idle) and hibernate | Lock screen unlocked with the fingerprint right after resume, one test each |
+| sudo | Used once after the setup; the log does not show whether the finger or the password authenticated |
+| polkit | Configured by the setup; not exercised yet |
 
 Test machine: ASUS ExpertBook B9403CVAR, reader firmware 0x316 (USB
 `bcdDevice` 3.16), Omarchy (Arch Linux), kernel 7.2.15, fprintd 1.94.5,
