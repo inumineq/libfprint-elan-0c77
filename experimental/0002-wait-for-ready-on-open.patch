@@ -1,0 +1,183 @@
+EXPERIMENTAL, not applied by the PKGBUILD. Applies on top of patch 0001.
+
+Polls the status query (40 ff 00) after opening the device until the sensor
+reports ready (0x03), as the upstream elanmoc driver does. Meant to avoid the
+firmware hang described in docs/protocol-notes.md. Verified without a finger
+on the sensor only; never tested in the situation it is meant to fix.
+
+License: LGPL-2.1-or-later, like libfprint.
+
+diff --git a/libfprint/drivers/elanmoc2/elanmoc2.c b/libfprint/drivers/elanmoc2/elanmoc2.c
+index 4834910c..9d2cdc26 100644
+--- a/libfprint/drivers/elanmoc2/elanmoc2.c
++++ b/libfprint/drivers/elanmoc2/elanmoc2.c
+@@ -46,6 +46,7 @@ struct _FpiDeviceElanMoC2
+   const Elanmoc2Cmd *rx_cmd;
+   gboolean           rx_short_is_error;
+   guint              rx_discarded;
++  guint              ready_polls;
+ 
+   /* Command status data */
+   FpiSsm      *ssm;
+@@ -163,7 +164,7 @@ elanmoc2_cmd_usb_callback (FpiUsbTransfer *transfer,
+                    "endpoint 0x%02x while waiting for a %d-byte reply: %s",
+                    transfer->actual_length, cmd->ep_in, cmd->in_len, hex);
+ 
+-          if (cmd == &cmd_get_enrolled_count)
++          if (cmd == &cmd_get_enrolled_count || cmd == &cmd_get_status)
+             {
+               /* This query is the first command of every operation. With a
+                * finger resting on the sensor right after the device is
+@@ -390,6 +391,86 @@ elanmoc2_cancel (FpDevice *device)
+   elanmoc2_cmd_transceive (device, &cmd_abort, buffer_out);
+ }
+ 
++enum {
++  OPEN_GET_STATUS,
++  OPEN_CHECK_STATUS,
++  OPEN_NUM_STATES
++};
++
++/* Right after being opened (and reset) with a finger resting on it,
++ * 04f3:0c77 is not ready: it answers the first command with six zero bytes
++ * and can stop answering altogether. Poll the status query, as the elanmoc
++ * driver does, until the sensor reports ready. */
++static void
++elanmoc2_open_run_state (FpiSsm *ssm, FpDevice *device)
++{
++  FpiDeviceElanMoC2 *self = FPI_DEVICE_ELANMOC2 (device);
++
++  g_autoptr(GBytes) buffer_in = g_steal_pointer (&self->buffer_in);
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OPEN_GET_STATUS: {
++        g_autoptr(GByteArray) buffer_out =
++          elanmoc2_prepare_cmd (self, &cmd_get_status);
++
++        if (buffer_out == NULL)
++          {
++            fpi_ssm_mark_completed (g_steal_pointer (&self->ssm));
++            break;
++          }
++        elanmoc2_cmd_transceive (device, &cmd_get_status, buffer_out);
++        break;
++      }
++
++    case OPEN_CHECK_STATUS: {
++        gsize len = buffer_in != NULL ? g_bytes_get_size (buffer_in) : 0;
++        const guint8 *data =
++          buffer_in != NULL ? g_bytes_get_data (buffer_in, NULL) : NULL;
++
++        self->ready_polls++;
++
++        if (len >= 2 && data[1] == ELANMOC2_RESP_READY)
++          {
++            if (self->ready_polls > 1)
++              fp_warn ("Sensor ready after %u status polls", self->ready_polls);
++            else
++              fp_info ("Sensor ready");
++            fpi_ssm_mark_completed (g_steal_pointer (&self->ssm));
++            break;
++          }
++
++        if (len >= 2)
++          fp_warn ("Sensor not ready, status 0x%02x 0x%02x (poll %u)",
++                   data[0], data[1], self->ready_polls);
++        else
++          fp_warn ("Sensor not ready, no status (poll %u)", self->ready_polls);
++
++        if (self->ready_polls >= ELANMOC2_READY_RETRIES)
++          {
++            fp_warn ("Sensor never reported ready, continuing anyway");
++            fpi_ssm_mark_completed (g_steal_pointer (&self->ssm));
++            break;
++          }
++        fpi_ssm_jump_to_state_delayed (ssm, OPEN_GET_STATUS,
++                                       ELANMOC2_READY_DELAY_MS);
++        break;
++      }
++
++    default:
++      break;
++    }
++}
++
++static void
++elanmoc2_open_ssm_completed (FpiSsm *ssm, FpDevice *device, GError *error)
++{
++  if (error != NULL)
++    g_usb_device_release_interface (fpi_device_get_usb_device (device),
++                                    0, 0, NULL);
++  fpi_device_open_complete (device, error);
++}
++
+ static void
+ elanmoc2_open (FpDevice *device)
+ {
+@@ -432,7 +513,16 @@ elanmoc2_open (FpDevice *device)
+         }
+     }
+   fpi_device_set_nr_enroll_stages (device, self->enroll_times);
+-  fpi_device_open_complete (device, NULL);
++
++  if (!(self->dev_type & ELANMOC2_QUIRK_WAIT_READY))
++    {
++      fpi_device_open_complete (device, NULL);
++      return;
++    }
++
++  self->ready_polls = 0;
++  self->ssm = fpi_ssm_new (device, elanmoc2_open_run_state, OPEN_NUM_STATES);
++  fpi_ssm_start (self->ssm, elanmoc2_open_ssm_completed);
+ }
+ 
+ static void
+@@ -1324,7 +1414,8 @@ static const FpIdEntry elanmoc2_id_table[] = {
+   {.vid = ELANMOC2_VEND_ID, .pid = 0x0c5e, .driver_data = ELANMOC2_DEV_0C5E},
+   {.vid = ELANMOC2_VEND_ID, .pid = 0x0c77,
+    .driver_data = ELANMOC2_QUIRK_NO_WIPE_FALLBACK |
+-                  ELANMOC2_QUIRK_ARM_M4_ENROLL},
++                  ELANMOC2_QUIRK_ARM_M4_ENROLL |
++                  ELANMOC2_QUIRK_WAIT_READY},
+   {.vid = ELANMOC2_VEND_ID, .pid = 0x0c7c, .driver_data = ELANMOC2_ALL_DEV},
+   {.vid = ELANMOC2_VEND_ID, .pid = 0x0c90, .driver_data = ELANMOC2_ALL_DEV},
+   {.vid = 0, .pid = 0, .driver_data = 0}
+diff --git a/libfprint/drivers/elanmoc2/elanmoc2.h b/libfprint/drivers/elanmoc2/elanmoc2.h
+index 9a95ef16..6278708e 100644
+--- a/libfprint/drivers/elanmoc2/elanmoc2.h
++++ b/libfprint/drivers/elanmoc2/elanmoc2.h
+@@ -43,6 +43,9 @@
+ #define ELANMOC2_MAX_PRINTS 10
+ #define ELANMOC2_MAX_RETRIES 10
+ #define ELANMOC2_RETRY_DELAY_MS 100
++#define ELANMOC2_RESP_READY 0x03
++#define ELANMOC2_READY_RETRIES 60
++#define ELANMOC2_READY_DELAY_MS 50
+ 
+ // USB parameters
+ #define ELANMOC2_EP_CMD_OUT (0x1 | FPI_USB_ENDPOINT_OUT)
+@@ -70,6 +73,8 @@
+ #define ELANMOC2_QUIRK_NO_WIPE_FALLBACK (1 << 1)
+ /* ARM-M4 sensors build the template from more samples */
+ #define ELANMOC2_QUIRK_ARM_M4_ENROLL (1 << 2)
++/* Poll the status query until the sensor reports ready before using it */
++#define ELANMOC2_QUIRK_WAIT_READY (1 << 3)
+ 
+ // Subtract the 2-byte header
+ #define ELANMOC2_USER_ID_MAX_LEN (cmd_finger_info.in_len - 2)
+@@ -126,6 +131,14 @@ static const Elanmoc2Cmd cmd_finger_info = {
+   .ep_in = ELANMOC2_EP_CMD_IN,
+ };
+ 
++/* Same status query the elanmoc driver polls after opening the device */
++static const Elanmoc2Cmd cmd_get_status = {
++  .cmd = {0xff, 0x00},
++  .out_len = 3,
++  .in_len = 2,
++  .ep_in = ELANMOC2_EP_CMD_IN,
++};
++
+ static const Elanmoc2Cmd cmd_get_enrolled_count = {
+   .cmd = {0xff, 0x04},
+   .out_len = 3,
